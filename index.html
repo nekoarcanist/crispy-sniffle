@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b1020">
+<title>Blind Corridor</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+</head>
+<body>
+<style>
+  /* Layout: full-bleed first-person sky view, edge glows for steering, tiny readout in the corner. Single dark look by choice. */
+  :root {
+    --sky: #0b1020; --ink: #cfe3ff; --dim: #6c7fa3; --glow: 122, 215, 255; --warn: #ff6b6b;
+    --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; overscroll-behavior: none; background: var(--sky); color: var(--ink); overflow: hidden; }
+  body { touch-action: none; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: calc(12px + env(safe-area-inset-left, 0px)); top: calc(12px + env(safe-area-inset-top, 0px));
+    font: 11px/1.5 var(--mono); color: var(--dim); letter-spacing: .04em; pointer-events: none; z-index: 2;
+  }
+  #hud b { color: var(--ink); font-weight: 600; }
+  #hud .dead { color: var(--warn); }
+  .edge {
+    position: fixed; top: 0; bottom: 0; width: 22vw; max-width: 180px; pointer-events: none; opacity: 0; z-index: 1;
+  }
+  .edge.l { left: 0;  background: linear-gradient(90deg,  rgba(var(--glow), .55), rgba(var(--glow), 0)); }
+  .edge.r { right: 0; background: linear-gradient(270deg, rgba(var(--glow), .55), rgba(var(--glow), 0)); }
+  .edge::after {
+    content: ""; position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, rgba(var(--glow), .35) 0 2px, transparent 2px 28px);
+    background-size: 100% 28px; animation: rush .35s linear infinite;
+  }
+  @keyframes rush { to { background-position: 0 28px; } }
+  @media (prefers-reduced-motion: reduce) { .edge::after { animation: none; } }
+  #reticle {
+    position: fixed; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px;
+    border: 1.5px solid rgba(var(--glow), .6); border-radius: 50%; pointer-events: none; z-index: 1;
+  }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap">
+<div class="edge l" id="edgeL"></div>
+<div class="edge r" id="edgeR"></div>
+<div id="reticle"></div>
+<div id="hud">BLIND CORRIDOR · v0.1.11<br>score <b id="score">0</b> · best <b id="best">0</b> · hit <b id="hits">0</b><br>aimed/s <b id="aim">0.25</b> · lane/s <b id="ar">1</b> · spawn/s <b id="sr">4</b> · cubes <b id="n">0</b> · fov <b id="fov">75</b><br><span id="hint">← → / A D / drag · H hitbox · 1 axes</span></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js" crossorigin="anonymous"></script>
+<script>
+const VERSION = "0.1.11";  // 0.0.x = earlier builds (archived in versions/), 0.1.x from here on
+// ===== World axes =====
+// You start at (0, 0, 0), dead centre of the screen. You look straight up along +Z (the sky),
+// you steer along X (+X = right), and Y runs along the screen's vertical (+Y = screen down;
+// with X right and Z away, a right-handed frame puts Y down, the usual camera convention).
+// Cubes spawn high on +Z and fall toward Z = 0.
+// ===== Tuning (tweak these, no re-prompting needed) =====
+const GRAVITY        = 18;   // units/s² while a cube accelerates (along -Z)
+const TERMINAL_V     = 32;   // top falling speed
+const SPAWN_HEIGHT   = 75;   // how far overhead (Z) cubes appear
+const SPREAD_Y       = 18;   // spawn spread along Y around you (screen up/down)
+const GEN_SCALE      = 0.5;  // multiplies every spawn rate below (0.5 = half)
+const SPAWN_BASE     = 4;    // random cubes per second at the start
+const SPAWN_RAMP     = 2;    // +1 random cube/s every this many seconds
+const SPAWN_MAX      = 40;   // safety cap on random cubes/s
+const AIMED_BASE     = 1;    // aimed cubes per second at the start (before AIMED_SCALE)
+const AIMED_RAMP     = 5;    // +1 aimed cube/s every this many seconds (before AIMED_SCALE)
+const AIMED_SCALE    = 0.5;  // aimed cube frequency multiplier (0.5 = half as often as 0.0.7)
+const AIM_JITTER     = 0.3;  // how far an aimed cube can be off-center
+const LANE_BASE      = 1;    // guaranteed cubes/s spawned at your current x (depth and height random)
+const LANE_RAMP      = 5;    // +1 lane cube/s every this many seconds
+const MIN_GAP        = 2.9;  // spawn spacing (horizontal) ...
+const MIN_VGAP       = 6;    // ... unless this far apart vertically
+const WOBBLE         = 2.0;  // random sideways drift on spawn (lane cubes get none along x)
+const CUBE_RADIUS    = 1.12; // collision size of a cube (scale with CUBE_SIZE)
+const BOUNCE         = 0.6;  // 0 = dead stop, 1 = perfect bounce
+const GLANCE_KICK    = 0.8;  // extra sideways shove when cubes clip each other
+const LANE_LIMIT     = 10;   // you can move to ±this x
+const WALL_GAP       = 3;
+const WALL_HEIGHT    = 140;
+const WALL_LENGTH    = 160;
+const STEER_SPEED    = 14;
+const STEER_EASE     = 8;
+const ROLL_AMOUNT    = 0.10;
+const FOV_START      = 75;   // field of view at the start of a run
+const FOV_MAX        = 100;  // widest it gets
+const FOV_RAMP       = 0.4;  // degrees added per second survived
+const CUBE_SIZE      = 1.6;  // cube edge length (was 2)
+const HIT_PLANE      = 0;    // Z the cube's lowest point must cross to count (0 = your eyes)
+const HIT_SIZE       = CUBE_SIZE; // width of the square hit zone under each cube
+let   SHOW_HITBOX    = true; // red square under each cube showing its hit zone (toggle with H)
+let   SHOW_AXES      = true; // X/Y/Z direction indicator in the corner (toggle with 1)
+const AXES_SIZE      = 140;  // indicator size in CSS pixels
+const SHARDS_PER_CUBE = 9;
+const SHATTER_FORCE  = 9;    // how hard cubes burst on game over
+const GLASS_HEIGHT   = 12;   // how far above you the Game Over glass hangs
+const GLASS_COLS     = 8, GLASS_ROWS = 5;
+const CUBE_COLORS    = [0x3fc1ff, 0xff5fa2, 0xffb347, 0x8ce36b, 0xb48cff];
+
+const WALL_X = LANE_LIMIT + WALL_GAP;
+const rnd = (a = 1) => (Math.random() * 2 - 1) * a;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+scene.fog = new THREE.Fog(0x0b1020, 30, SPAWN_HEIGHT + 30);
+
+const camera = new THREE.PerspectiveCamera(FOV_START, innerWidth / innerHeight, 0.1, 300);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const hemi = new THREE.HemisphereLight(0x8899cc, 0x0b1020, 0.55);
+hemi.position.set(0, 0, 1); // sky colour comes from +Z
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(6, -4, -10);
+scene.add(sun);
+
+// Stars
+{
+  const pos = new Float32Array(900);
+  for (let i = 0; i < 300; i++) { pos[i*3] = rnd(160); pos[i*3+1] = rnd(120); pos[i*3+2] = 150 + Math.random()*40; }
+  const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x6c7fa3, size: 0.6, fog: false })));
+}
+
+// Towers
+function facadeTexture() {
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const g = c.getContext("2d");
+  g.fillStyle = "#121a30"; g.fillRect(0, 0, 64, 64);
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+    g.fillStyle = Math.random() < 0.3 ? "#e8c46a" : "#1d2a4a";
+    g.fillRect(x*16 + 4, y*16 + 3, 8, 10);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(WALL_LENGTH / 8, WALL_HEIGHT / 8);
+  t.magFilter = THREE.NearestFilter;
+  return t;
+}
+for (const side of [-1, 1]) {
+  const wall = new THREE.Mesh(new THREE.BoxGeometry(2, WALL_HEIGHT, WALL_LENGTH), new THREE.MeshBasicMaterial({ map: facadeTexture() }));
+  wall.rotation.x = Math.PI / 2; // stand the tower up along Z
+  wall.position.set(side * (WALL_X + 1), 0, WALL_HEIGHT / 2 - 4);
+  scene.add(wall);
+}
+
+// ===== Cubes =====
+const cubeGeo = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
+const edgeGeo = new THREE.EdgesGeometry(cubeGeo);
+const lineMat = new THREE.LineBasicMaterial({ color: 0x0b1020 });
+const cubeMats = CUBE_COLORS.map(c => new THREE.MeshLambertMaterial({ color: c }));
+let cubes = [], colorIdx = 0;
+
+// Hitbox: a level square, HIT_SIZE wide, centred under the cube and riding at its lowest point.
+// It doesn't tumble with the cube. If you're under it when it reaches eye level, you're hit.
+const hitGeo = new THREE.PlaneGeometry(HIT_SIZE, HIT_SIZE); // lies flat in X/Y, facing you along Z
+const hitMat = new THREE.MeshBasicMaterial({ color: 0xff2a2a, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthWrite: false, fog: false });
+function removeCube(c) {
+  scene.remove(c);
+  if (c.userData.hit) scene.remove(c.userData.hit);
+}
+
+// kind: "random" anywhere · "lane" at your x, random y/height · "aimed" right over you
+function findSpot(kind) {
+  const xMax = WALL_X - 1.8;
+  for (let tries = 0; tries < (kind === "random" ? 12 : 30); tries++) {
+    const x = kind === "random" ? rnd(xMax) : camera.position.x + (kind === "aimed" ? rnd(AIM_JITTER) : 0);
+    const y = kind === "aimed" ? camera.position.y + rnd(AIM_JITTER) : rnd(SPREAD_Y);
+    const z = SPAWN_HEIGHT + Math.random() * (kind === "aimed" ? 30 : kind === "lane" ? 20 : 10);
+    if (Math.abs(x) > xMax) continue;
+    const clear = cubes.every(c =>
+      Math.hypot(c.position.x - x, c.position.y - y) >= MIN_GAP || Math.abs(c.position.z - z) >= MIN_VGAP);
+    if (clear) return { x, y, z };
+  }
+  return null;
+}
+
+function spawn(kind) {
+  const s = findSpot(kind);
+  if (!s) return false;
+  colorIdx = (colorIdx + 1 + Math.floor(Math.random() * (CUBE_COLORS.length - 1))) % CUBE_COLORS.length;
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(cubeGeo, cubeMats[colorIdx]));
+  const edges = new THREE.LineSegments(edgeGeo, lineMat); edges.scale.setScalar(1.002); g.add(edges);
+  g.position.set(s.x, s.y, s.z);
+  g.rotation.set(Math.random()*6, Math.random()*6, 0);
+  g.userData = {
+    color: colorIdx,
+    hang: kind === "aimed" ? 0 : Math.random() * 0.6,
+    vel: new THREE.Vector3(kind === "random" ? rnd(WOBBLE) : 0, kind === "aimed" ? 0 : rnd(WOBBLE), 0),
+    spin: new THREE.Vector3(rnd(), rnd(), rnd())
+  };
+  const hit = new THREE.Mesh(hitGeo, hitMat);
+  hit.renderOrder = 5; hit.visible = SHOW_HITBOX;
+  g.userData.hit = hit;
+  scene.add(g, hit); cubes.push(g);
+  return true;
+}
+
+// ===== XYZ indicator (corner gizmo that turns with the camera) =====
+const axesScene = new THREE.Scene();
+const axesCam = new THREE.OrthographicCamera(-1.75, 1.75, 1.75, -1.75, 0.1, 10);
+function axisLabel(text, color) {
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const g = c.getContext("2d");
+  g.font = '700 44px "JetBrains Mono", ui-monospace, monospace';
+  g.textAlign = "center"; g.textBaseline = "middle"; g.fillStyle = color;
+  g.fillText(text, 32, 34);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }));
+  s.scale.setScalar(0.55);
+  return s;
+}
+// True world axes, so the indicator matches the game: X = steer right, Y = screen down,
+// Z = up into the sky, away from you (the way you look and the way cubes come from).
+for (const [dir, hex, css, name] of [
+  [new THREE.Vector3(1, 0, 0), 0xff5a5a, "#ff5a5a", "X"],
+  [new THREE.Vector3(0, 1, 0), 0x6be36b, "#6be36b", "Y"],
+  [new THREE.Vector3(0, 0, 1), 0x5aa8ff, "#5aa8ff", "Z"]
+]) {
+  axesScene.add(new THREE.ArrowHelper(dir, new THREE.Vector3(), 1, hex, 0.28, 0.14));
+  const l = axisLabel(name, css); l.position.copy(dir).multiplyScalar(1.3); axesScene.add(l);
+  // Negative halves for X and Y (both are in play: left of centre is -X, screen-up is -Y)
+  if (name !== "Z") {
+    const neg = dir.clone().negate();
+    const a = new THREE.ArrowHelper(neg, new THREE.Vector3(), 1, hex, 0.2, 0.1);
+    a.line.material.transparent = a.cone.material.transparent = true;
+    a.line.material.opacity = a.cone.material.opacity = 0.5;
+    axesScene.add(a);
+    const nl = axisLabel("-" + name, css); nl.material.opacity = 0.6;
+    nl.position.copy(neg).multiplyScalar(1.3); axesScene.add(nl);
+  }
+}
+// Look at the gizmo from slightly off-axis so the Z arrow (pointing away) reads as depth, not a dot
+const AXES_TILT = new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.7, 0.7, 0, "YXZ"));
+function drawAxes() {
+  axesCam.quaternion.copy(camera.quaternion).multiply(AXES_TILT);
+  axesCam.position.set(0, 0, 4).applyQuaternion(axesCam.quaternion);
+  const s = AXES_SIZE, pad = 12;
+  renderer.autoClear = false;
+  renderer.clearDepth();
+  renderer.setViewport(innerWidth - s - pad, pad, s, s);
+  renderer.render(axesScene, axesCam);
+  renderer.setViewport(0, 0, innerWidth, innerHeight);
+  renderer.autoClear = true;
+}
+
+// The cube's lowest point right now, accounting for its tumble
+const CORNERS = [];
+for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) CORNERS.push(new THREE.Vector3(x, y, z).multiplyScalar(CUBE_SIZE / 2));
+const _v = new THREE.Vector3(), _low = new THREE.Vector3();
+function lowestCorner(c) {
+  _low.set(0, 0, Infinity);
+  for (const k of CORNERS) {
+    _v.copy(k).applyEuler(c.rotation);
+    if (_v.z < _low.z) _low.copy(_v);
+  }
+  return _low.add(c.position);
+}
+
+function collideCubes() {
+  const minD = CUBE_RADIUS * 2, n = new THREE.Vector3();
+  for (let i = 0; i < cubes.length; i++) for (let j = i + 1; j < cubes.length; j++) {
+    const a = cubes[i], b = cubes[j];
+    n.subVectors(b.position, a.position);
+    const d = n.length();
+    if (d >= minD || d === 0) continue;
+    n.divideScalar(d);
+    const ua = a.userData, ub = b.userData;
+    ua.hang = ub.hang = 0;
+    // push apart
+    const push = (minD - d) / 2;
+    a.position.addScaledVector(n, -push); b.position.addScaledVector(n, push);
+    // bounce along the contact normal (equal mass)
+    const rv = (ub.vel.x - ua.vel.x) * n.x + (ub.vel.y - ua.vel.y) * n.y + (ub.vel.z - ua.vel.z) * n.z;
+    if (rv >= 0) continue;
+    const j1 = -(1 + BOUNCE) * rv / 2;
+    ua.vel.addScaledVector(n, -j1); ub.vel.addScaledVector(n, j1);
+    // glance: shove sideways so the deflection reads clearly
+    const hx = n.x, hy = n.y, hl = Math.hypot(hx, hy) || 1, k = Math.abs(rv) * GLANCE_KICK;
+    ua.vel.x -= hx / hl * k; ua.vel.y -= hy / hl * k;
+    ub.vel.x += hx / hl * k; ub.vel.y += hy / hl * k;
+    ua.spin.add(new THREE.Vector3(rnd(3), rnd(3), rnd(3)));
+    ub.spin.add(new THREE.Vector3(rnd(3), rnd(3), rnd(3)));
+  }
+}
+
+// ===== Shards (cube pieces on game over) =====
+const shardGeo = new THREE.TetrahedronGeometry(0.275 * CUBE_SIZE);
+let shards = [];
+function shatter(c) {
+  const u = c.userData;
+  for (let k = 0; k < SHARDS_PER_CUBE; k++) {
+    const m = new THREE.Mesh(shardGeo, cubeMats[u.color]);
+    m.position.copy(c.position).add(new THREE.Vector3(rnd(0.8), rnd(0.8), rnd(0.8)));
+    const dir = new THREE.Vector3(rnd(), rnd(), rnd()).normalize();
+    m.userData = { vel: u.vel.clone().addScaledVector(dir, SHATTER_FORCE * (0.5 + Math.random())), spin: new THREE.Vector3(rnd(8), rnd(8), rnd(8)) };
+    scene.add(m); shards.push(m);
+  }
+  removeCube(c);
+}
+
+// ===== Game Over glass =====
+let glass = [];
+function viewSizeAt(d) {
+  const h = 2 * d * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  return { w: h * camera.aspect, h };
+}
+function buildGlass(score, best) {
+  const view = viewSizeAt(GLASS_HEIGHT);
+  const W = view.w * 0.9, H = Math.min(W * 0.55, view.h * 0.5);
+  const cw = 1024, ch = Math.round(cw * H / W);
+  const cv = document.createElement("canvas"); cv.width = cw; cv.height = ch;
+  const g = cv.getContext("2d");
+  g.fillStyle = "rgba(150,205,255,0.16)"; g.fillRect(0, 0, cw, ch);
+  const glint = g.createLinearGradient(0, 0, cw, ch);
+  glint.addColorStop(0.25, "rgba(255,255,255,0)"); glint.addColorStop(0.32, "rgba(255,255,255,0.16)"); glint.addColorStop(0.4, "rgba(255,255,255,0)");
+  g.fillStyle = glint; g.fillRect(0, 0, cw, ch);
+  g.strokeStyle = "rgba(220,240,255,0.85)"; g.lineWidth = 8; g.strokeRect(4, 4, cw - 8, ch - 8);
+  g.textAlign = "center"; g.textBaseline = "middle"; g.fillStyle = "rgba(255,255,255,0.95)";
+  g.font = `700 ${Math.round(cw * 0.12)}px "JetBrains Mono", ui-monospace, monospace`;
+  g.fillText("GAME OVER", cw / 2, ch * 0.4);
+  g.font = `400 ${Math.round(cw * 0.045)}px "JetBrains Mono", ui-monospace, monospace`;
+  g.fillStyle = "rgba(220,240,255,0.9)";
+  g.fillText(`score ${score}   ·   best ${best}`, cw / 2, ch * 0.66);
+  g.fillText("space / tap to restart", cw / 2, ch * 0.82);
+  const tex = new THREE.CanvasTexture(cv);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false, fog: false });
+
+  // Jittered grid → irregular triangles. Points are in screen terms: p.x = world X, p.z = screen-up (= world -Y).
+  const ox = camera.position.x, pts = [];
+  for (let r = 0; r <= GLASS_ROWS; r++) {
+    pts[r] = [];
+    for (let c = 0; c <= GLASS_COLS; c++) {
+      const edge = r === 0 || c === 0 || r === GLASS_ROWS || c === GLASS_COLS;
+      const jx = edge && (c === 0 || c === GLASS_COLS) ? 0 : rnd(0.35) * W / GLASS_COLS;
+      const jz = edge && (r === 0 || r === GLASS_ROWS) ? 0 : rnd(0.35) * H / GLASS_ROWS;
+      pts[r][c] = { x: -W/2 + c * W / GLASS_COLS + jx, z: -H/2 + r * H / GLASS_ROWS + jz };
+    }
+  }
+  const tris = [];
+  for (let r = 0; r < GLASS_ROWS; r++) for (let c = 0; c < GLASS_COLS; c++) {
+    const a = pts[r][c], b = pts[r][c+1], d = pts[r+1][c], e = pts[r+1][c+1];
+    if (Math.random() < 0.5) tris.push([a, b, e], [a, e, d]); else tris.push([a, b, d], [b, e, d]);
+  }
+  for (const t of tris) {
+    const cx = (t[0].x + t[1].x + t[2].x) / 3, cz = (t[0].z + t[1].z + t[2].z) / 3;
+    const pos = [], uv = [];
+    for (const p of t) { pos.push(p.x - cx, -(p.z - cz), 0); uv.push((p.x + W/2) / W, (p.z + H/2) / H); }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(ox + cx, -cz, GLASS_HEIGHT);
+    m.renderOrder = 10;
+    m.userData = { tri: t.map(p => ({ x: p.x + ox, z: p.z })), broken: false, vel: new THREE.Vector3(), spin: new THREE.Vector3() };
+    scene.add(m); glass.push(m);
+  }
+}
+function inTri(x, z, [a, b, c]) {
+  const s = (p, q) => (x - q.x) * (p.z - q.z) - (p.x - q.x) * (z - q.z);
+  const d1 = s(a, b), d2 = s(b, c), d3 = s(c, a);
+  return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+}
+function breakGlassAt(x, z, impact) {
+  const p = glass.find(g => !g.userData.broken && inTri(x, z, g.userData.tri));
+  if (!p) return false;
+  const u = p.userData;
+  u.broken = true;
+  u.vel.set(impact.x * 0.3 + rnd(2), impact.y * 0.3 + rnd(2), impact.z * 0.35);
+  u.spin.set(rnd(6), rnd(6), rnd(6));
+  return true;
+}
+
+// ===== Input =====
+const keys = {};
+let mode = "play", deadT = 0;
+addEventListener("keydown", e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.code === "Space") { e.preventDefault(); if (mode === "dead" && deadT > 0.8) restart(); }
+  if (e.code === "Digit1" || e.code === "Numpad1") SHOW_AXES = !SHOW_AXES;
+  if (e.code === "KeyH") { SHOW_HITBOX = !SHOW_HITBOX; cubes.forEach(c => c.userData.hit.visible = SHOW_HITBOX); }
+});
+addEventListener("keyup", e => keys[e.key.toLowerCase()] = false);
+let dragX = null, dragTarget = null, dragStartX = 0;
+addEventListener("pointerdown", e => {
+  if (mode === "dead") { if (deadT > 0.8) restart(); return; }
+  dragX = e.clientX; dragStartX = camera.position.x; dragTarget = dragStartX;
+});
+addEventListener("pointermove", e => {
+  if (dragX === null || mode !== "play") return;
+  dragTarget = THREE.MathUtils.clamp(dragStartX + (e.clientX - dragX) * (LANE_LIMIT * 2 / innerWidth) * 1.4, -LANE_LIMIT, LANE_LIMIT);
+});
+const endDrag = () => { dragX = null; dragTarget = null; };
+addEventListener("pointerup", endDrag);
+addEventListener("pointercancel", endDrag);
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ===== Score =====
+let best = 0;
+try { best = parseInt(localStorage.getItem("blindCorridorBest") || "0", 10) || 0; } catch (e) {}
+const $ = id => document.getElementById(id);
+const el = { aim: $("aim"), score: $("score"), best: $("best"), hits: $("hits"), ar: $("ar"), sr: $("sr"), n: $("n"), hint: $("hint"), fov: $("fov"),
+             edgeL: $("edgeL"), edgeR: $("edgeR"), reticle: $("reticle") };
+el.best.textContent = best;
+
+let t = 0, aimAcc = 0, laneAcc = 0, rndAcc = 0, vx = 0, hits = 0, hitFlash = 0, score = 0;
+
+function die() {
+  mode = "dead"; deadT = 0; hits = 1; hitFlash = 1; vx = 0; endDrag();
+  if (score > best) { best = score; try { localStorage.setItem("blindCorridorBest", String(best)); } catch (e) {} }
+  el.best.textContent = best;
+  el.hint.innerHTML = '<span class="dead">HIT · space / tap to restart</span>';
+  buildGlass(score, best);
+  cubes.forEach(shatter); cubes = [];
+}
+function restart() {
+  for (const o of [...shards, ...glass]) scene.remove(o);
+  if (glass[0]) { glass[0].material.map.dispose(); glass[0].material.dispose(); }
+  glass.forEach(g => g.geometry.dispose());
+  shards = []; glass = [];
+  cubes.forEach(removeCube); cubes = [];
+  t = aimAcc = laneAcc = rndAcc = vx = hits = score = 0;
+  camera.position.set(0, 0, 0); mode = "play";
+  camera.fov = FOV_START; camera.updateProjectionMatrix();
+  el.hint.textContent = "← → / A D / drag · H hitbox · 1 axes";
+}
+
+// ===== Loop =====
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (mode === "play") {
+    // Steering
+    let input = 0;
+    if (keys["arrowleft"] || keys["a"]) input -= 1;
+    if (keys["arrowright"] || keys["d"]) input += 1;
+    if (dragTarget !== null) input = THREE.MathUtils.clamp((dragTarget - camera.position.x) * 0.6, -1, 1);
+    vx += (input * STEER_SPEED - vx) * Math.min(1, dt * STEER_EASE);
+    camera.position.x = THREE.MathUtils.clamp(camera.position.x + vx * dt, -LANE_LIMIT, LANE_LIMIT);
+    if (Math.abs(camera.position.x) === LANE_LIMIT) vx *= 0.5;
+
+    // Difficulty ramp + spawning
+    t += dt;
+    score = Math.floor(t * 10);
+    const fov = Math.min(FOV_MAX, FOV_START + t * FOV_RAMP);
+    if (Math.abs(camera.fov - fov) > 0.01) { camera.fov = fov; camera.updateProjectionMatrix(); }
+    el.fov.textContent = Math.round(fov);
+    const aimedRate = (AIMED_BASE + Math.floor(t / AIMED_RAMP)) * AIMED_SCALE * GEN_SCALE;
+    const laneRate = (LANE_BASE + Math.floor(t / LANE_RAMP)) * GEN_SCALE;
+    const spawnRate = Math.min(SPAWN_MAX, SPAWN_BASE + Math.floor(t / SPAWN_RAMP)) * GEN_SCALE;
+    aimAcc += dt * aimedRate; while (aimAcc >= 1) { aimAcc -= 1; spawn("aimed"); }
+    // Lane cubes are guaranteed: if there's no room this frame, the debt carries to the next
+    laneAcc = Math.min(laneAcc + dt * laneRate, 5); while (laneAcc >= 1 && spawn("lane")) laneAcc -= 1;
+    rndAcc += dt * spawnRate; while (rndAcc >= 1) { rndAcc -= 1; spawn("random"); }
+    el.aim.textContent = +aimedRate.toFixed(2);
+    el.ar.textContent = +laneRate.toFixed(1); el.sr.textContent = +spawnRate.toFixed(1);
+  } else {
+    deadT += dt;
+  }
+
+  // Camera
+  const steer = vx / STEER_SPEED;
+  camera.up.set(Math.sin(steer * ROLL_AMOUNT), -Math.cos(steer * ROLL_AMOUNT), 0); // screen-up = -Y, rolled by steering
+  camera.lookAt(camera.position.x, camera.position.y, 100);                         // look straight up +Z
+  el.edgeL.style.opacity = Math.max(0, -steer).toFixed(3);
+  el.edgeR.style.opacity = Math.max(0,  steer).toFixed(3);
+
+  // Cubes
+  const xMax = WALL_X - CUBE_RADIUS;
+  for (let i = cubes.length - 1; i >= 0; i--) {
+    const c = cubes[i], u = c.userData;
+    c.rotation.x += u.spin.x * dt; c.rotation.y += u.spin.y * dt; c.rotation.z += u.spin.z * dt;
+    if (u.hang > 0) { u.hang -= dt; u.hit.position.set(c.position.x, c.position.y, lowestCorner(c).z); continue; }
+    u.vel.z = Math.max(-TERMINAL_V, u.vel.z - GRAVITY * dt);
+    c.position.addScaledVector(u.vel, dt);
+    if (Math.abs(c.position.x) > xMax) { c.position.x = Math.sign(c.position.x) * xMax; u.vel.x *= -BOUNCE; } // bounce off towers
+    // Hit when the cube's bottom crosses eye level with you inside its square footprint
+    const lowZ = lowestCorner(c).z;
+    u.hit.position.set(c.position.x, c.position.y, lowZ);
+    const crossed = u.prevLow !== undefined && u.prevLow > HIT_PLANE && lowZ <= HIT_PLANE;
+    u.prevLow = lowZ;
+    if (mode === "play" && crossed &&
+        Math.abs(c.position.x - camera.position.x) < HIT_SIZE / 2 &&
+        Math.abs(c.position.y - camera.position.y) < HIT_SIZE / 2) { die(); break; }
+    if (c.position.z < -3) { removeCube(c); cubes.splice(i, 1); } // fully past you
+  }
+  if (mode === "play") collideCubes();
+
+  // Shards fall, and smash any glass they pass through
+  for (let i = shards.length - 1; i >= 0; i--) {
+    const s = shards[i], u = s.userData, prevZ = s.position.z;
+    u.vel.z -= GRAVITY * dt;
+    s.position.addScaledVector(u.vel, dt);
+    s.rotation.x += u.spin.x * dt; s.rotation.y += u.spin.y * dt; s.rotation.z += u.spin.z * dt;
+    if (prevZ > GLASS_HEIGHT && s.position.z <= GLASS_HEIGHT && breakGlassAt(s.position.x, -s.position.y, u.vel)) u.vel.multiplyScalar(0.5);
+    if (s.position.z < -3) { scene.remove(s); shards.splice(i, 1); }
+  }
+  // Broken glass tumbles past you
+  for (let i = glass.length - 1; i >= 0; i--) {
+    const g = glass[i], u = g.userData;
+    if (!u.broken) continue;
+    u.vel.z -= GRAVITY * 0.6 * dt;
+    g.position.addScaledVector(u.vel, dt);
+    g.rotation.x += u.spin.x * dt; g.rotation.y += u.spin.y * dt; g.rotation.z += u.spin.z * dt;
+    if (g.position.z < -3) { scene.remove(g); g.geometry.dispose(); glass.splice(i, 1); }
+  }
+
+  hitFlash = Math.max(0, hitFlash - dt * 2);
+  el.reticle.style.borderColor = hitFlash > 0 ? `rgba(255,90,90,${0.6 + hitFlash * 0.4})` : "";
+  el.reticle.style.transform = `scale(${1 + hitFlash * 2})`;
+  el.score.textContent = score; el.hits.textContent = hits; el.n.textContent = cubes.length;
+  renderer.render(scene, camera);
+  if (SHOW_AXES) drawAxes();
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+
+<script>
+// ===== Phone app plumbing =====
+// Offline: register the service worker
+if ("serviceWorker" in navigator) addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+// Keep the screen awake while the game is open and visible
+let wakeLock = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && document.visibilityState === "visible" && !wakeLock) {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } } catch (e) {}
+}
+addEventListener("pointerdown", keepAwake);
+addEventListener("keydown", keepAwake);
+document.addEventListener("visibilitychange", keepAwake);
+// Block long-press menus and pinch zoom
+addEventListener("contextmenu", e => e.preventDefault());
+addEventListener("gesturestart", e => e.preventDefault());
+</script>
+</body>
+</html>
