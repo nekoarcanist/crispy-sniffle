@@ -47,10 +47,10 @@
 <div class="edge l" id="edgeL"></div>
 <div class="edge r" id="edgeR"></div>
 <div id="reticle"></div>
-<div id="hud">BLIND CORRIDOR · v0.1.12<br>score <b id="score">0</b> · best <b id="best">0</b> · hit <b id="hits">0</b><br>aimed/s <b id="aim">0.25</b> · lane/s <b id="ar">1</b> · spawn/s <b id="sr">4</b> · cubes <b id="n">0</b> · fov <b id="fov">75</b><br><span id="hint">← → / A D / drag · H hitbox · 1 axes</span></div>
+<div id="hud">BLIND CORRIDOR · v0.1.13<br>score <b id="score">0</b> · best <b id="best">0</b> · hit <b id="hits">0</b><br>aimed/s <b id="aim">0.25</b> · lane/s <b id="ar">1</b> · spawn/s <b id="sr">4</b> · cubes <b id="n">0</b> · fov <b id="fov">75</b><br><span id="hint">← → / A D / drag · H hitbox · 1 axes</span></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js" crossorigin="anonymous"></script>
 <script>
-const VERSION = "0.1.12";  // 0.0.x = earlier builds (archived in versions/), 0.1.x from here on
+const VERSION = "0.1.13";  // 0.0.x = earlier builds (archived in versions/), 0.1.x from here on
 // ===== World axes =====
 // You start at (0, 0, 0), dead centre of the screen. You look straight up along +Z (the sky),
 // you steer along X (+X = right), and Y runs along the screen's vertical (+Y = screen down;
@@ -90,13 +90,14 @@ const FOV_RAMP       = 0.4;  // degrees added per second survived
 const CUBE_SIZE      = 1.6;  // cube edge length (was 2)
 const HIT_PLANE      = 0;    // Z the cube's lowest point must cross to count (0 = your eyes)
 const HIT_SIZE       = CUBE_SIZE; // width of the square hit zone under each cube
-let   SHOW_HITBOX    = true; // red square under each cube showing its hit zone (toggle with H)
-let   SHOW_AXES      = true; // X/Y/Z direction indicator in the corner (toggle with 1)
+let   SHOW_HITBOX    = false; // red square under each cube showing its hit zone (toggle with H)
+let   SHOW_AXES      = false; // X/Y/Z direction indicator in the corner (toggle with 1)
 const AXES_SIZE      = 140;  // indicator size in CSS pixels
 const SHARDS_PER_CUBE = 9;
 const SHATTER_FORCE  = 9;    // how hard cubes burst on game over
 const GLASS_HEIGHT   = 12;   // how far above you the Game Over glass hangs
-const GLASS_COLS     = 8, GLASS_ROWS = 5;
+const GLASS_COLS     = 8;
+const SCORE_BAND     = [0.56, 0.76]; // top/bottom of the unbreakable score strip, as a fraction of the plate height from the top
 const CUBE_COLORS    = [0x3fc1ff, 0xff5fa2, 0xffb347, 0x8ce36b, 0xb48cff];
 
 const WALL_X = LANE_LIMIT + WALL_GAP;
@@ -332,22 +333,30 @@ function buildGlass(score, best) {
   const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false, fog: false });
 
   // Jittered grid → irregular triangles. Points are in screen terms: p.x = world X, p.z = screen-up (= world -Y).
-  const ox = camera.position.x, pts = [];
-  for (let r = 0; r <= GLASS_ROWS; r++) {
-    pts[r] = [];
-    for (let c = 0; c <= GLASS_COLS; c++) {
-      const edge = r === 0 || c === 0 || r === GLASS_ROWS || c === GLASS_COLS;
-      const jx = edge && (c === 0 || c === GLASS_COLS) ? 0 : rnd(0.35) * W / GLASS_COLS;
-      const jz = edge && (r === 0 || r === GLASS_ROWS) ? 0 : rnd(0.35) * H / GLASS_ROWS;
-      pts[r][c] = { x: -W/2 + c * W / GLASS_COLS + jx, z: -H/2 + r * H / GLASS_ROWS + jz };
+  // The score line sits in a solid band that can't break; the glass above and below it shatters.
+  const ox = camera.position.x, pieces = [];
+  const bandTop = H/2 - SCORE_BAND[0] * H, bandBot = H/2 - SCORE_BAND[1] * H;
+  function shardGrid(z0, z1, rows) { // jittered grid between z0 (bottom) and z1 (top), straight outer edges
+    const pts = [];
+    for (let r = 0; r <= rows; r++) {
+      pts[r] = [];
+      for (let c = 0; c <= GLASS_COLS; c++) {
+        const jx = c === 0 || c === GLASS_COLS ? 0 : rnd(0.35) * W / GLASS_COLS;
+        const jz = r === 0 || r === rows ? 0 : rnd(0.35) * (z1 - z0) / rows;
+        pts[r][c] = { x: -W/2 + c * W / GLASS_COLS + jx, z: z0 + r * (z1 - z0) / rows + jz };
+      }
+    }
+    for (let r = 0; r < rows; r++) for (let c = 0; c < GLASS_COLS; c++) {
+      const a = pts[r][c], b = pts[r][c+1], d = pts[r+1][c], e = pts[r+1][c+1];
+      if (Math.random() < 0.5) pieces.push({ t: [a, b, e] }, { t: [a, e, d] });
+      else pieces.push({ t: [a, b, d] }, { t: [b, e, d] });
     }
   }
-  const tris = [];
-  for (let r = 0; r < GLASS_ROWS; r++) for (let c = 0; c < GLASS_COLS; c++) {
-    const a = pts[r][c], b = pts[r][c+1], d = pts[r+1][c], e = pts[r+1][c+1];
-    if (Math.random() < 0.5) tris.push([a, b, e], [a, e, d]); else tris.push([a, b, d], [b, e, d]);
-  }
-  for (const t of tris) {
+  shardGrid(bandTop, H/2, 3);   // GAME OVER section
+  shardGrid(-H/2, bandBot, 2);  // restart hint section
+  const q = [{ x: -W/2, z: bandBot }, { x: W/2, z: bandBot }, { x: W/2, z: bandTop }, { x: -W/2, z: bandTop }];
+  pieces.push({ t: [q[0], q[1], q[2]], solid: true }, { t: [q[0], q[2], q[3]], solid: true });
+  for (const { t, solid } of pieces) {
     const cx = (t[0].x + t[1].x + t[2].x) / 3, cz = (t[0].z + t[1].z + t[2].z) / 3;
     const pos = [], uv = [];
     for (const p of t) { pos.push(p.x - cx, -(p.z - cz), 0); uv.push((p.x + W/2) / W, (p.z + H/2) / H); }
@@ -357,7 +366,7 @@ function buildGlass(score, best) {
     const m = new THREE.Mesh(geo, mat);
     m.position.set(ox + cx, -cz, GLASS_HEIGHT);
     m.renderOrder = 10;
-    m.userData = { tri: t.map(p => ({ x: p.x + ox, z: p.z })), broken: false, vel: new THREE.Vector3(), spin: new THREE.Vector3() };
+    m.userData = { tri: t.map(p => ({ x: p.x + ox, z: p.z })), solid: !!solid, broken: false, vel: new THREE.Vector3(), spin: new THREE.Vector3() };
     scene.add(m); glass.push(m);
   }
 }
@@ -370,6 +379,7 @@ function breakGlassAt(x, z, impact) {
   const p = glass.find(g => !g.userData.broken && inTri(x, z, g.userData.tri));
   if (!p) return false;
   const u = p.userData;
+  if (u.solid) return "solid"; // score band: shards bounce off it
   u.broken = true;
   u.vel.set(impact.x * 0.3 + rnd(2), impact.y * 0.3 + rnd(2), impact.z * 0.35);
   u.spin.set(rnd(6), rnd(6), rnd(6));
@@ -502,7 +512,11 @@ function tick(now) {
     u.vel.z -= GRAVITY * dt;
     s.position.addScaledVector(u.vel, dt);
     s.rotation.x += u.spin.x * dt; s.rotation.y += u.spin.y * dt; s.rotation.z += u.spin.z * dt;
-    if (prevZ > GLASS_HEIGHT && s.position.z <= GLASS_HEIGHT && breakGlassAt(s.position.x, -s.position.y, u.vel)) u.vel.multiplyScalar(0.5);
+    if (prevZ > GLASS_HEIGHT && s.position.z <= GLASS_HEIGHT) {
+      const hit = breakGlassAt(s.position.x, -s.position.y, u.vel);
+      if (hit === "solid") { s.position.z = GLASS_HEIGHT + 0.01; u.vel.z = Math.abs(u.vel.z) * 0.3; u.vel.x *= 0.6; u.vel.y *= 0.6; }
+      else if (hit) u.vel.multiplyScalar(0.5);
+    }
     if (s.position.z < -3) { scene.remove(s); shards.splice(i, 1); }
   }
   // Broken glass tumbles past you

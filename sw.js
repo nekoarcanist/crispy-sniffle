@@ -1,5 +1,5 @@
 // Bump this when you change any file, so phones pick up the new version
-const CACHE = "blind-corridor-v0.1.12";
+const CACHE = "blind-corridor-v0.1.13";
 const CORE = [
   "./", "./index.html", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png",
